@@ -1,8 +1,13 @@
+import ipaddress
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import zipfile
+from urllib.parse import urlparse
+
+import httpx
 
 from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -30,6 +35,54 @@ def save_upload(video: UploadFile, work: str) -> str:
                 raise HTTPException(413, f"Video larger than {MAX_UPLOAD_MB} MB")
             f.write(chunk)
     return src
+
+
+def _check_public_url(url: str):
+    """Защита от SSRF: только http(s) и только публичные IP."""
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise HTTPException(400, "url must be http(s)")
+    try:
+        infos = socket.getaddrinfo(p.hostname, p.port or 443)
+    except socket.gaierror:
+        raise HTTPException(400, "Cannot resolve url host")
+    for info in infos:
+        if not ipaddress.ip_address(info[4][0]).is_global:
+            raise HTTPException(400, "url points to a non-public address")
+
+
+def download_video(url: str, work: str) -> str:
+    src = os.path.join(work, "input")
+    limit = MAX_UPLOAD_MB * 1024 * 1024
+    try:
+        with httpx.Client(follow_redirects=False, timeout=60) as client:
+            for _ in range(5):  # вручную идём по редиректам, проверяя каждый
+                _check_public_url(url)
+                with client.stream("GET", url) as r:
+                    if r.is_redirect:
+                        url = str(r.url.join(r.headers["location"]))
+                        continue
+                    if r.status_code != 200:
+                        raise HTTPException(400, f"Download failed: HTTP {r.status_code}")
+                    size = 0
+                    with open(src, "wb") as f:
+                        for chunk in r.iter_bytes(1024 * 1024):
+                            size += len(chunk)
+                            if size > limit:
+                                raise HTTPException(413, f"Video larger than {MAX_UPLOAD_MB} MB")
+                            f.write(chunk)
+                    return src
+            raise HTTPException(400, "Too many redirects")
+    except httpx.HTTPError as e:
+        raise HTTPException(400, f"Download error: {e}")
+
+
+def get_source(video, url, work: str) -> str:
+    if video is not None:
+        return save_upload(video, work)
+    if url:
+        return download_video(url, work)
+    raise HTTPException(400, "Provide a video file or a url")
 
 
 def run_ffmpeg(cmd):
@@ -63,7 +116,8 @@ def health():
 @app.post("/extract")
 def extract(
     background: BackgroundTasks,
-    video: UploadFile = File(...),
+    video: UploadFile | None = File(default=None),
+    url: str | None = None,   # ссылка на видео (вместо файла)
     fps: float = 1.0,            # сколько кадров в секунду брать
     max_frames: int = 100,       # лимит кадров
     width: int = 0,              # 0 = оригинальный размер
@@ -81,7 +135,7 @@ def extract(
 
     work = tempfile.mkdtemp(prefix="frames_")
     background.add_task(shutil.rmtree, work, ignore_errors=True)
-    src = save_upload(video, work)
+    src = get_source(video, url, work)
 
     out_dir = os.path.join(work, "out")
     os.makedirs(out_dir)
@@ -127,7 +181,8 @@ def extract(
 @app.post("/audio")
 def audio(
     background: BackgroundTasks,
-    video: UploadFile = File(...),
+    video: UploadFile | None = File(default=None),
+    url: str | None = None,   # ссылка на видео (вместо файла)
     bitrate: str = "128k",
     x_api_key: str | None = Header(default=None),
 ):
@@ -135,7 +190,7 @@ def audio(
     check_key(x_api_key)
     work = tempfile.mkdtemp(prefix="audio_")
     background.add_task(shutil.rmtree, work, ignore_errors=True)
-    src = save_upload(video, work)
+    src = get_source(video, url, work)
 
     if not has_audio(src):
         raise HTTPException(400, "Video has no audio track")
